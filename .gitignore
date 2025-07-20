@@ -1,6 +1,37 @@
-# .gitignore
-.env
+# Python-specific files
 __pycache__/
-*.session
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Virtual environment
 venv/
-downloads/*
+env/
+.venv/
+
+# Project-specific directories
+downloads/
+logs/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Log files
+*.log
+
+# Local session files
+session_name.session
+session_name.session-journal
