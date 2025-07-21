@@ -8,9 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from telethon.sync import TelegramClient
-from telethon.errors import RPCError, ChatAdminRequiredError, SessionPasswordNeededError
+from telethon.errors import RPCError, ChatAdminRequiredError
 from tqdm import tqdm
-from utils.logger import setup_logger
 from utils.helpers import parse_size, parse_date, sanitize_filename
 
 # Configure encoding for Windows
@@ -24,7 +23,6 @@ if sys.platform == "win32":
 
 # Load environment variables
 load_dotenv()
-logger = setup_logger('telegram_downloader')
 
 class VideoDownloader:
     def __init__(self):
@@ -39,6 +37,7 @@ class VideoDownloader:
         self.download_folder.mkdir(exist_ok=True)
         self.max_retries = 3
         self.retry_delay = 5  # Seconds to wait between retries
+        self.chunk_size = 100  # Process messages in chunks to manage API load
 
     def validate_env_vars(self):
         """Validate required environment variables and return their values."""
@@ -58,55 +57,83 @@ class VideoDownloader:
         return api_id, api_hash
 
     async def get_eligible_videos(self, group_name):
-        """Retrieve videos from a group that meet size and date criteria."""
+        """Retrieve all videos from a group that meet size and date criteria."""
         videos = []
         since_date = parse_date(os.getenv('SINCE_DATE', ''))
         min_size = parse_size(os.getenv('MIN_VIDEO_SIZE', '0MB'))
         max_size_total = parse_size(os.getenv('MAX_TOTAL_SIZE', '10GB'))
-        max_downloads = int(os.getenv('MAX_DOWNLOADS', '100'))
         total_size = 0
+        offset_id = 0  # For pagination
+        total_messages_checked = 0
 
-        for attempt in range(self.max_retries):
-            try:
-                async for message in self.client.iter_messages(group_name):
-                    if not message.video:
-                        continue
+        while True:
+            chunk_videos = []
+            chunk_messages = []
+            for attempt in range(self.max_retries):
+                try:
+                    async for message in self.client.iter_messages(group_name, limit=self.chunk_size, offset_id=offset_id):
+                        chunk_messages.append(message)
+                    break  # Success, exit retry loop
+                except (RPCError, OSError) as e:
+                    print(f"Attempt {attempt + 1} failed for {group_name}: {str(e)}")
+                    if attempt + 1 < self.max_retries:
+                        print(f"Retrying in {self.retry_delay} seconds...")
+                        await asyncio.sleep(self.retry_delay)
+                    else:
+                        print(f"Failed to process {group_name} after {self.max_retries} attempts")
+                        return videos
+                except ChatAdminRequiredError:
+                    print(f"Permission denied for group {group_name}. Ensure the account has access.")
+                    return videos
 
-                    # Ensure naive datetime for comparison
-                    message_date = message.date.replace(tzinfo=None) if message.date.tzinfo else message.date
+            total_messages_checked += len(chunk_messages)
+            print(f"Checked {total_messages_checked} messages in {group_name}")
 
-                    if since_date and message_date < since_date:
-                        continue
+            for message in chunk_messages:
+                if not message.video:
+                    continue
 
-                    # Check if video has a size attribute
-                    video_size = getattr(message.video, 'size', None)
-                    if video_size is None:
-                        logger.warning(f"Skipping video in message {message.id} from {group_name}: No size attribute")
-                        logger.debug(f"Video object: {type(message.video).__name__}, Attributes: {dir(message.video)}")
-                        continue
+                # Ensure naive datetime for comparison
+                message_date = message.date.replace(tzinfo=None) if message.date.tzinfo else message.date
 
-                    if video_size < min_size:
-                        continue
+                if since_date and message_date < since_date:
+                    continue
 
-                    total_size += video_size
-                    if total_size > max_size_total:
-                        logger.warning(f"Total size limit ({max_size_total} bytes) reached for {group_name}")
-                        break
-                    videos.append(message)
-                    if len(videos) >= max_downloads:
-                        break
-                return videos  # Success, exit retry loop
-            except (RPCError, OSError) as e:
-                logger.error(f"Attempt {attempt + 1} failed for {group_name}: {str(e)}")
-                if attempt + 1 < self.max_retries:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
-                    await asyncio.sleep(self.retry_delay)
+                # Check if video has a size attribute
+                video_size = getattr(message.video, 'size', None)
+                if video_size is None:
+                    print(f"Skipping video in message {message.id} from {group_name}: No size attribute")
+                    continue
+
+                if video_size < min_size:
+                    continue
+
+                total_size += video_size
+                if total_size > max_size_total:
+                    print(f"Total size limit ({max_size_total} bytes) reached for {group_name}")
+                    return videos  # Exit early if size limit reached
+
+                # Check if video already downloaded
+                file_name = getattr(message.video, 'file_name', None)
+                if file_name:
+                    ext = Path(file_name).suffix or '.mp4'
                 else:
-                    logger.error(f"Failed to process {group_name} after {self.max_retries} attempts")
-                    return []
-            except ChatAdminRequiredError:
-                logger.error(f"Permission denied for group {group_name}. Ensure the account has access.")
-                return []
+                    mime_type = getattr(message.video, 'mime_type', 'video/mp4')
+                    ext = '.mp4' if 'mp4' in mime_type.lower() else '.mkv' if 'matroska' in mime_type.lower() else '.webm' if 'webm' in mime_type.lower() else '.mp4'
+                filename = sanitize_filename(f"{message_date.strftime('%Y-%m-%d')}_{message.id}{ext}")
+                if (self.download_folder / filename).exists():
+                    print(f"Skipping video {message.id} from {group_name}: Already downloaded as {filename}")
+                    continue
+
+                chunk_videos.append(message)
+
+            videos.extend(chunk_videos)
+            if not chunk_messages:  # No more messages to fetch
+                break
+            offset_id = chunk_messages[-1].id  # Update offset for next chunk
+
+        print(f"Found {len(videos)} eligible videos in {group_name}")
+        return videos
 
     async def run(self):
         """Process groups and download eligible videos."""
@@ -127,18 +154,18 @@ class VideoDownloader:
                         await self.client.connect()
                     break
                 except (OSError, RPCError) as e:
-                    logger.error(f"Connection attempt {attempt + 1} failed: {str(e)}")
+                    print(f"Connection attempt {attempt + 1} failed: {str(e)}")
                     if attempt + 1 < self.max_retries:
-                        logger.info(f"Retrying connection in {self.retry_delay} seconds...")
+                        print(f"Retrying connection in {self.retry_delay} seconds...")
                         await asyncio.sleep(self.retry_delay)
                     else:
                         raise ConnectionError(f"Failed to connect after {self.max_retries} attempts: {str(e)}")
 
             for group in groups:
-                logger.info(f"Processing group: {group}")
+                print(f"Processing group: {group}")
                 videos = await self.get_eligible_videos(group)
                 if not videos:
-                    logger.info(f"No eligible videos found in {group}")
+                    print(f"No eligible videos found in {group}")
                     continue
 
                 for msg in tqdm(videos, desc=f"Downloading from {group} ({len(videos)} videos, {sum(getattr(v.video, 'size', 0)/1024**2 for v in videos):.2f} MB)"):
@@ -150,19 +177,18 @@ class VideoDownloader:
                         else:
                             mime_type = getattr(msg.video, 'mime_type', 'video/mp4')
                             ext = '.mp4' if 'mp4' in mime_type.lower() else '.mkv' if 'matroska' in mime_type.lower() else '.webm' if 'webm' in mime_type.lower() else '.mp4'
-                            logger.debug(f"Message {msg.id} from {group}: No file_name, using mime_type {mime_type} for extension {ext}")
 
                         filename = sanitize_filename(f"{msg.date.strftime('%Y-%m-%d')}_{msg.id}{ext}")
                         await msg.download_media(self.download_folder / filename)
-                        logger.info(f"Downloaded {filename} from {group}")
+                        print(f"Downloaded {filename} from {group}")
                         await asyncio.sleep(1)  # Delay to avoid API rate limits
                     except Exception as e:
-                        logger.error(f"Failed to download video {msg.id} from {group}: {str(e)}")
+                        print(f"Failed to download video {msg.id} from {group}: {str(e)}")
 
         except Exception as e:
-            logger.error(f"Fatal error: {str(e)}")
+            print(f"Fatal error: {str(e)}")
         finally:
-            logger.info("Download process completed")
+            print("Download process completed")
 
 if __name__ == "__main__":
     downloader = VideoDownloader()

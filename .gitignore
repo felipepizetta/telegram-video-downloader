@@ -17,20 +17,31 @@ env/
 
 # Project-specific directories
 downloads/
-logs/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
 
 # OS-specific files
 .DS_Store
 Thumbs.db
+
+# Dependency directories
+/site-packages/
+pip-selfcheck.json
+
+# Byte-compiled / optimized / DLL files
+*.pyd
+*.dll
+*.so
 
 # Distribution / packaging
 dist/
 build/
 *.egg-info/
 *.egg
-
-# Log files
-*.log
 
 # Local session files
 session_name.session
