@@ -17,6 +17,7 @@ env/
 
 # Project-specific directories
 downloads/
+logs/
 
 # IDE and editor files
 .vscode/
