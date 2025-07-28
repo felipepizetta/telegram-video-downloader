@@ -17,15 +17,24 @@ class VideoDownloader:
         except Exception as e:
             logging.error(f"Failed to initialize Telegram client: {str(e)}")
             raise ValueError(f"Failed to initialize Telegram client: {str(e)}")
-        self.log_callback = gui_callback  # For log messages
-        self.progress_callback = None  # For progress updates
+        self.log_callback = gui_callback
+        self.progress_callback = None
+        self.video_count_callback = None
+        self.is_running = True  # Control flag for graceful shutdown
 
     def log(self, message):
         logging.info(message)
         if self.log_callback:
             self.log_callback(message)
 
+    def stop(self):
+        self.is_running = False
+        self.log("Received stop signal")
+
     async def download_file(self, message, filename, min_size_bytes, max_total_size_bytes, total_downloaded):
+        if not self.is_running:
+            self.log("Download stopped by user")
+            return total_downloaded, False
         if total_downloaded >= max_total_size_bytes:
             self.log("Max total size reached. Stopping download.")
             return total_downloaded, False
@@ -56,56 +65,55 @@ class VideoDownloader:
 
         total_downloaded = 0
         continue_download = True
+        total_videos = 0
 
         try:
-            # Ensure fresh connection
-            if self.client.is_connected():
-                await self.client.disconnect()
-            self.log("Connecting to Telegram...")
-            await self.client.connect()
+            if not self.client.is_connected():
+                self.log("Connecting to Telegram...")
+                await self.client.connect()
             if not await self.client.is_user_authorized():
                 self.log("Session is not authorized. Please re-authenticate.")
                 raise ValueError("Session is not authorized. Please re-authenticate.")
 
+            # Count total videos with a reasonable limit
             for group in groups:
-                if not continue_download:
+                if not self.is_running:
                     break
                 try:
-                    # Normalize group identifier
+                    group_id = f"@{group}" if group and not group.startswith(('@', '-')) else group
+                    self.log(f"Counting videos in group: {group_id}")
+                    entity = await self.client.get_entity(group_id)
+                    video_count = 0
+                    async for message in self.client.iter_messages(entity, limit=1000):  # Reduced limit for performance
+                        if not self.is_running:
+                            break
+                        if message.media and isinstance(message.media, MessageMediaDocument):
+                            for attr in getattr(message.media.document, 'attributes', []):
+                                if isinstance(attr, DocumentAttributeVideo) and message.file.size >= min_size_bytes:
+                                    video_count += 1
+                                    break
+                    total_videos += video_count
+                    self.log(f"Found {video_count} videos in group {group_id} meeting size criteria.")
+                except Exception as e:
+                    self.log(f"Cannot count videos in group {group_id}: {str(e)}")
+                    continue
+
+            if self.video_count_callback:
+                self.video_count_callback(total_videos)
+            self.log(f"Total videos to download: {total_videos}")
+
+            # Download videos
+            for group in groups:
+                if not continue_download or not self.is_running:
+                    break
+                try:
                     group_id = f"@{group}" if group and not group.startswith(('@', '-')) else group
                     self.log(f"Attempting to access group: {group_id}")
-
-                    # Revalidate group access and message iteration
-                    try:
-                        entity = await self.client.get_entity(group_id)
-                        self.log(f"Entity resolved for {group_id}: {entity.__class__.__name__} (ID: {entity.id})")
-                        # Check for video messages
-                        video_found = False
-                        async for message in self.client.iter_messages(entity, limit=10):
-                            if message.media:
-                                if isinstance(message.media, MessageMediaDocument):
-                                    for attr in getattr(message.media.document, 'attributes', []):
-                                        if isinstance(attr, DocumentAttributeVideo):
-                                            video_found = True
-                                            self.log(f"Video found in message {message.id} in {group_id}")
-                                            break
-                                # Handle potential video in other media types
-                                elif isinstance(message.media, MessageMediaPhoto):
-                                    self.log(f"Photo found in message {message.id} in {group_id}, skipping")
-                                else:
-                                    self.log(f"Unknown media type in message {message.id} in {group_id}: {type(message.media)}")
-                            if video_found:
-                                break
-                        if not video_found:
-                            self.log(f"No videos found in group {group_id} within the first 10 messages. Ensure videos exist and are accessible.")
-                            continue
-                        self.log(f"Group {group_id} is accessible and contains videos.")
-                    except Exception as e:
-                        self.log(f"Validation failed for group {group_id}: {str(e)}. Ensure the group exists and your account has permission to view messages.")
-                        continue
-
-                    # Proceed with downloading videos
+                    entity = await self.client.get_entity(group_id)
+                    self.log(f"Group {group_id} is accessible.")
                     async for message in self.client.iter_messages(entity):
+                        if not self.is_running:
+                            break
                         if message.media and isinstance(message.media, MessageMediaDocument):
                             for attr in getattr(message.media.document, 'attributes', []):
                                 if isinstance(attr, DocumentAttributeVideo):
@@ -115,19 +123,18 @@ class VideoDownloader:
                                     )
                                     break
                 except PeerIdInvalidError:
-                    self.log(f"Error accessing group {group}: Invalid group ID or you are not a member. Check if the group exists and your account has access.")
+                    self.log(f"Error accessing group {group}: Invalid group ID or you are not a member.")
                 except ChannelInvalidError:
-                    self.log(f"Error accessing group {group}: Group or channel does not exist or is inaccessible. Verify the group name or ID.")
+                    self.log(f"Error accessing group {group}: Group or channel does not exist or is inaccessible.")
                 except UsernameInvalidError:
-                    self.log(f"Error accessing group {group}: Invalid username format. Use @username or a numeric chat ID.")
+                    self.log(f"Error accessing group {group}: Invalid username format.")
                 except RPCError as e:
-                    self.log(f"API error accessing group {group}: {str(e)}. If session-related, try deleting session_name.session and re-authenticating.")
+                    self.log(f"API error accessing group {group}: {str(e)}.")
                 except Exception as e:
                     if "TLObject was expected" in str(e):
-                        self.log(f"Error accessing group {group}: {str(e)}. This likely indicates a private group, restricted permissions, or a session issue. Try using the numeric chat ID (e.g., -100123456789), re-authenticating, or checking group permissions.")
+                        self.log(f"Error accessing group {group}: {str(e)}. Try using the numeric chat ID.")
                     else:
-                        self.log(f"Unexpected error accessing group {group}: {str(e)}. Ensure the group exists, is accessible, and your account has permission to view messages.")
-                    # Pause to avoid rate limits
+                        self.log(f"Unexpected error accessing group {group}: {str(e)}.")
                     await asyncio.sleep(1)
         except Exception as e:
             self.log(f"Download error: {str(e)}")

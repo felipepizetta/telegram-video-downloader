@@ -23,7 +23,7 @@ Um aplicativo em Python com interface gráfica (GUI) para baixar vídeos de grup
 ## Instalação
 
 1. **Clone o Repositório**:
-   - Execute: `git clone <URL_DO_REPOSITORIO>`
+   - Execute: `git clone https://github.com/felipepizetta/telegram-video-downloader.git`
    - Navegue até o diretório: `cd telegram-video-downloader`
 
 2. **Crie um Ambiente Virtual (opcional, mas recomendado)**:
@@ -33,7 +33,7 @@ Um aplicativo em Python com interface gráfica (GUI) para baixar vídeos de grup
      - Para Windows: `venv\Scripts\activate`
 
 3. **Instale as Dependências**:
-   - Execute: `pip install PyQt6 telethon python-dotenv`
+   - Execute: `pip install -r requirements.txt`
 
 4. **Configure as Credenciais do Telegram**:
    - Crie um arquivo `.env` na raiz do projeto com o seguinte conteúdo:
@@ -69,6 +69,3 @@ Um aplicativo em Python com interface gráfica (GUI) para baixar vídeos de grup
 
 - Os vídeos são salvos em `downloads/` com nomes no formato `YYYY-MM-DD_ID.ext`.
 - A janela é compacta (550x450) e não pode ser maximizada, mas pode ser redimensionada.
-
-# ⚙️ Stack Técnica
-![Screenshot](https://github.com/felipepizetta/telegram-video-downloader/blob/50afe79423e9c45bade44feb43a527225e1790b0/assets/img/stack.png)

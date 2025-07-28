@@ -2,17 +2,21 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QPushButton, 
     QTextEdit, QLabel, QProgressBar, QScrollArea, QLineEdit, QFileDialog, QMessageBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEventLoop
 from pathlib import Path
 from utils.downloader import VideoDownloader
 from gui.auth_window import AuthWindow
+from telethon.tl.types import MessageMediaDocument
 import asyncio
 import logging
+import configparser
+import sys
 
 class DownloadThread(QThread):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, str, float)
     error_signal = pyqtSignal(str)
+    video_count_signal = pyqtSignal(int)
 
     def __init__(self, downloader, groups, min_size, max_total_size, loop):
         super().__init__()
@@ -21,8 +25,10 @@ class DownloadThread(QThread):
         self.min_size = min_size
         self.max_total_size = max_total_size
         self.loop = loop
+        self.is_running = True  # Control flag for graceful shutdown
         self.downloader.progress_callback = self.progress_update
         self.downloader.log_callback = self.log_update
+        self.downloader.video_count_callback = self.video_count_update
 
     def progress_update(self, message_id, filename, percentage):
         try:
@@ -38,21 +44,40 @@ class DownloadThread(QThread):
             self.error_signal.emit(f"Log update error: {str(e)}")
             logging.error(f"Log update error: {str(e)}")
 
+    def video_count_update(self, total_videos):
+        try:
+            self.video_count_signal.emit(total_videos)
+        except Exception as e:
+            self.error_signal.emit(f"Video count update error: {str(e)}")
+            logging.error(f"Video count update error: {str(e)}")
+
+    def stop(self):
+        self.is_running = False
+        self.downloader.stop()  # Signal downloader to stop
+
     def run(self):
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self.downloader.run(self.groups, self.min_size, self.max_total_size),
                 self.loop
             )
-            future.result()
+            while self.is_running and not future.done():
+                self.msleep(100)  # Allow thread to check for stop signal
+            if not self.is_running:
+                future.cancel()  # Cancel the coroutine if stopped
+            future.result()  # Wait for result or cancellation
+        except asyncio.CancelledError:
+            logging.info("Download thread cancelled")
         except Exception as e:
             self.error_signal.emit(f"Download failed to start: {str(e)}")
             logging.error(f"Download failed to start: {str(e)}")
 
 class MainWindow(QMainWindow):
-    def __init__(self, loop):
+    def __init__(self, loop, api_id=None, api_hash=None):
         super().__init__()
         self.loop = loop
+        self.api_id = api_id
+        self.api_hash = api_hash
         self.setWindowTitle("Telegram Video Downloader")
         self.setMinimumSize(550, 450)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint | Qt.WindowType.WindowMinimizeButtonHint)
@@ -61,8 +86,10 @@ class MainWindow(QMainWindow):
         self.download_folder.mkdir(exist_ok=True)
         self.downloader = None
         self.download_thread = None
+        self.downloads_occurred = False
         self.validated_groups = []
-        self.downloads_occurred = False  # Track if any downloads happened
+        self.total_videos = 0
+        self.remaining_videos = 0
 
         try:
             with open('gui/styles/styles.qss', 'r') as f:
@@ -81,11 +108,17 @@ class MainWindow(QMainWindow):
         # API credentials
         api_layout = QHBoxLayout()
         self.api_id_input = QLineEdit()
-        self.api_id_input.setPlaceholderText("Enter API ID")
+        self.api_id_input.setPlaceholderText("Enter API ID (optional if set in config)")
         self.api_id_input.setMaximumWidth(150)
         self.api_hash_input = QLineEdit()
-        self.api_hash_input.setPlaceholderText("Enter API Hash")
+        self.api_hash_input.setPlaceholderText("Enter API Hash (optional if set in config)")
         self.api_hash_input.setMaximumWidth(250)
+        if self.api_id:
+            self.api_id_input.setText(str(self.api_id))
+            self.api_id_input.setEnabled(False)
+        if self.api_hash:
+            self.api_hash_input.setText(self.api_hash)
+            self.api_hash_input.setEnabled(False)
         api_layout.addWidget(QLabel("API ID:"))
         api_layout.addWidget(self.api_id_input)
         api_layout.addWidget(QLabel("API Hash:"))
@@ -165,6 +198,24 @@ class MainWindow(QMainWindow):
         self.log_display.setReadOnly(True)
         main_layout.addWidget(self.log_display)
 
+    def save_config(self, api_id, api_hash):
+        """Save API credentials to config.ini."""
+        config = configparser.ConfigParser()
+        config['Telegram'] = {
+            'API_ID': str(api_id),
+            'API_HASH': api_hash
+        }
+        config_path = Path('config/config.ini')
+        config_path.parent.mkdir(exist_ok=True)
+        try:
+            with config_path.open('w', encoding='utf-8') as f:
+                config.write(f)
+            self.log_message(f"Created config.ini at {config_path}")
+            logging.info(f"Created config.ini at {config_path}")
+        except Exception as e:
+            self.log_message(f"Failed to create config.ini: {str(e)}")
+            logging.error(f"Failed to create config.ini: {str(e)}")
+
     def load_groups(self):
         self.groups_list.clear()
         groups_file = Path('config/groups.txt')
@@ -216,6 +267,11 @@ class MainWindow(QMainWindow):
             self.log_message(f"Folder set to: {folder}")
             logging.info(f"Folder set to: {folder}")
 
+    def set_video_count(self, total_videos):
+        self.total_videos = total_videos
+        self.remaining_videos = total_videos
+        self.log_message(f"Total videos to download: {total_videos}")
+
     def start_download(self):
         from utils.helpers import parse_size
         selected_groups = [item.text() for item in self.groups_list.selectedItems()]
@@ -224,15 +280,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Select at least one group to download.")
             return
 
-        # Validate inputs
-        api_id = self.api_id_input.text().strip()
-        api_hash = self.api_hash_input.text().strip()
-        min_size = self.size_input.text().strip()
-        max_total_size = self.max_size_input.text().strip()
+        api_id = self.api_id
+        api_hash = self.api_hash
+        if not api_id or not api_hash:
+            api_id = self.api_id_input.text().strip()
+            api_hash = self.api_hash_input.text().strip()
 
         if not api_id or not api_hash:
-            self.log_message("Please enter both API ID and API Hash.")
-            QMessageBox.warning(self, "Error", "Please enter both API ID and API Hash.")
+            self.log_message("Please enter both API ID and API Hash in config.ini or the GUI.")
+            QMessageBox.warning(self, "Error", "Please enter both API ID and API Hash in config.ini or the GUI.")
             return
 
         try:
@@ -241,6 +297,9 @@ class MainWindow(QMainWindow):
             self.log_message("API ID must be a valid integer.")
             QMessageBox.warning(self, "Error", "API ID must be a valid integer.")
             return
+
+        min_size = self.size_input.text().strip()
+        max_total_size = self.max_size_input.text().strip()
 
         try:
             parse_size(min_size)
@@ -256,21 +315,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Invalid max total size format: {max_total_size}. Expected format like '10GB'.")
             return
 
-        # Normalize group identifiers
         normalized_groups = []
         for group in selected_groups:
             if not group:
                 self.log_message(f"Skipping empty group name.")
                 continue
             if not (group.startswith(('@', '-')) or group.isdigit()):
-                group = f"@{group}"  # Normalize to username format
+                group = f"@{group}"
             normalized_groups.append(group)
         if not normalized_groups:
             self.log_message("No valid groups selected. Please add valid group names (e.g., @groupname or chat ID).")
             QMessageBox.warning(self, "Error", "No valid groups selected. Please add valid group names (e.g., @groupname or chat ID).")
             return
 
-        # Initialize downloader
         try:
             self.downloader = VideoDownloader(self.download_folder, api_id, api_hash, gui_callback=self.log_message)
         except Exception as e:
@@ -279,7 +336,6 @@ class MainWindow(QMainWindow):
             logging.error(f"Failed to initialize downloader: {str(e)}")
             return
 
-        # Check authentication
         async def check_auth():
             try:
                 if self.downloader.client.is_connected():
@@ -306,7 +362,6 @@ class MainWindow(QMainWindow):
             return
 
         if is_authorized:
-            # Validate groups before starting download
             async def validate_groups(groups):
                 valid_groups = []
                 try:
@@ -315,11 +370,10 @@ class MainWindow(QMainWindow):
                     for group in groups:
                         try:
                             entity = await self.downloader.client.get_entity(group)
-                            # Test message iteration to ensure access to messages
                             async for _ in self.downloader.client.iter_messages(entity, limit=1):
                                 pass
                             valid_groups.append(group)
-                            self.log_message(f"Group {group} is accessible and messages can be retrieved.")
+                            self.log_message(f"Group {group} is accessible.")
                         except Exception as e:
                             self.log_message(f"Cannot access group {group}: {str(e)}. Ensure the group exists, is accessible, and your account has permission to view messages.")
                             logging.error(f"Cannot access group {group}: {str(e)}")
@@ -337,6 +391,8 @@ class MainWindow(QMainWindow):
                     self.log_message("No accessible groups found. Please verify group names and permissions.")
                     QMessageBox.critical(self, "Error", "No accessible groups found. Please verify group names and permissions.")
                     return
+                if not Path('config/config.ini').exists() and not (self.api_id and self.api_hash):
+                    self.save_config(api_id, api_hash)
                 self.start_download_thread(self.validated_groups, min_size, max_total_size)
             except Exception as e:
                 self.log_message(f"Group validation error: {str(e)}")
@@ -344,10 +400,10 @@ class MainWindow(QMainWindow):
                 logging.error(f"Group validation error: {str(e)}")
         else:
             auth_window = AuthWindow(self.downloader.client, self.loop, parent=self)
-            auth_window.auth_completed.connect(lambda: self.start_download_after_auth(normalized_groups, min_size, max_total_size))
+            auth_window.auth_completed.connect(lambda: self.start_download_after_auth(normalized_groups, min_size, max_total_size, api_id, api_hash))
             auth_window.exec()
 
-    def start_download_after_auth(self, groups, min_size, max_total_size):
+    def start_download_after_auth(self, groups, min_size, max_total_size, api_id, api_hash):
         async def validate_groups(groups):
             valid_groups = []
             try:
@@ -356,11 +412,10 @@ class MainWindow(QMainWindow):
                 for group in groups:
                     try:
                         entity = await self.downloader.client.get_entity(group)
-                        # Test message iteration to ensure access to messages
                         async for _ in self.downloader.client.iter_messages(entity, limit=1):
                             pass
                         valid_groups.append(group)
-                        self.log_message(f"Group {group} is accessible and messages can be retrieved.")
+                        self.log_message(f"Group {group} is accessible.")
                     except Exception as e:
                         self.log_message(f"Cannot access group {group}: {str(e)}. Ensure the group exists, is accessible, and your account has permission to view messages.")
                         logging.error(f"Cannot access group {group}: {str(e)}")
@@ -378,6 +433,7 @@ class MainWindow(QMainWindow):
                 self.log_message("No accessible groups found. Please verify group names and permissions.")
                 QMessageBox.critical(self, "Error", "No accessible groups found. Please verify group names and permissions.")
                 return
+            self.save_config(api_id, api_hash)
             self.start_download_thread(self.validated_groups, min_size, max_total_size)
         except Exception as e:
             self.log_message(f"Group validation error: {str(e)}")
@@ -392,6 +448,7 @@ class MainWindow(QMainWindow):
             self.download_thread.log_signal.connect(self.log_message)
             self.download_thread.progress_signal.connect(self.update_progress)
             self.download_thread.error_signal.connect(self.handle_download_error)
+            self.download_thread.video_count_signal.connect(self.set_video_count)
             self.download_thread.finished.connect(self.download_finished)
             self.download_thread.start()
             self.log_message("Starting download process...")
@@ -419,22 +476,28 @@ class MainWindow(QMainWindow):
                 progress_bar = QProgressBar()
                 progress_bar.setMaximum(100)
                 progress_bar.setValue(int(percentage))
+                remaining_label = QLabel(f"Remaining: {self.remaining_videos}")
                 progress_layout.addWidget(label)
                 progress_layout.addWidget(progress_bar)
+                progress_layout.addWidget(remaining_label)
                 self.progress_layout.addWidget(progress_widget)
-                self.progress_bars[message_id] = (progress_widget, progress_bar)
+                self.progress_bars[message_id] = (progress_widget, progress_bar, remaining_label)
             else:
-                _, progress_bar = self.progress_bars[message_id]
+                _, progress_bar, remaining_label = self.progress_bars[message_id]
                 progress_bar.setValue(int(percentage))
+                remaining_label.setText(f"Remaining: {self.remaining_videos}")
             if percentage >= 100:
+                self.remaining_videos -= 1
                 self.remove_progress_bar(message_id)
+                for _, _, rem_label in self.progress_bars.values():
+                    rem_label.setText(f"Remaining: {self.remaining_videos}")
         except Exception as e:
             self.log_message(f"Progress update error: {str(e)}")
             logging.error(f"Progress update error: {str(e)}")
 
     def remove_progress_bar(self, message_id):
         if message_id in self.progress_bars:
-            progress_widget, _ = self.progress_bars[message_id]
+            progress_widget, _, _ = self.progress_bars[message_id]
             self.progress_layout.removeWidget(progress_widget)
             progress_widget.deleteLater()
             del self.progress_bars[message_id]
@@ -446,11 +509,13 @@ class MainWindow(QMainWindow):
     def download_finished(self):
         self.start_button.setEnabled(True)
         if self.validated_groups and self.downloads_occurred:
-            self.log_message("Download process completed")
-            logging.info("Download process completed")
+            self.log_message(f"Download process completed. {self.remaining_videos} videos remaining.")
+            logging.info(f"Download process completed. {self.remaining_videos} videos remaining.")
         else:
             self.log_message("No videos were downloaded due to inaccessible groups or no videos found.")
             logging.info("No videos were downloaded due to inaccessible groups or no videos found.")
+        self.total_videos = 0
+        self.remaining_videos = 0
 
     def log_message(self, message):
         self.log_display.append(message)
@@ -459,7 +524,7 @@ class MainWindow(QMainWindow):
         self.log_display.clear()
 
     async def disconnect_client(self):
-        if self.downloader and self.downloader.client.is_connected():
+        if self.downloader and self.downloader.client and self.downloader.client.is_connected():
             try:
                 await self.downloader.client.disconnect()
                 logging.info("Telegram client disconnected")
@@ -467,12 +532,29 @@ class MainWindow(QMainWindow):
                 logging.warning(f"Error during disconnect: {str(e)}")
 
     def closeEvent(self, event):
-        if self.download_thread and self.download_thread.isRunning():
-            self.download_thread.terminate()
-            self.download_thread.wait()
         try:
-            future = asyncio.run_coroutine_threadsafe(self.disconnect_client(), self.loop)
-            future.result()
+            if self.download_thread and self.download_thread.isRunning():
+                self.log_message("Stopping download thread...")
+                self.download_thread.stop()
+                self.download_thread.wait(5000)  # Wait up to 5 seconds
+                if self.download_thread.isRunning():
+                    logging.warning("Download thread did not stop gracefully, forcing termination")
+                    self.download_thread.terminate()
+            # Run disconnect_client synchronously
+            if self.downloader:
+                loop = QEventLoop()
+                asyncio.run_coroutine_threadsafe(self.disconnect_client(), self.loop).add_done_callback(lambda _: loop.quit())
+                loop.exec()
+            # Clean up asyncio loop
+            try:
+                tasks = asyncio.all_tasks(self.loop)
+                for task in tasks:
+                    task.cancel()
+                self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+                self.loop.run_until_complete(self.loop.shutdown_default_executor())
+            except Exception as e:
+                logging.warning(f"Error cleaning up asyncio loop: {str(e)}")
         except Exception as e:
-            logging.warning(f"Error during disconnect: {str(e)}")
-        event.accept()
+            logging.error(f"Error during close: {str(e)}")
+        finally:
+            event.accept()
