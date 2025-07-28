@@ -1,230 +1,138 @@
-import os
-import logging
-import asyncio
+from telethon import TelegramClient
+from telethon.errors import PeerIdInvalidError, ChannelInvalidError, UsernameInvalidError, RPCError
+from telethon.tl.types import MessageMediaDocument, DocumentAttributeVideo, MessageMediaPhoto
 from pathlib import Path
-from dotenv import load_dotenv
-from telethon.sync import TelegramClient
-from telethon.errors import RPCError, ChatAdminRequiredError
-from utils.helpers import parse_size, parse_date, sanitize_filename
-
-# Load environment variables
-load_dotenv()
-
-# Set up logging
-logging.basicConfig(
-    filename='logs/debug.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+import logging
+from utils.helpers import parse_size
+import asyncio
 
 class VideoDownloader:
-    def __init__(self, download_folder, gui_callback=None, progress_callback=None):
-        """Initialize Telegram client, download folder, and GUI callbacks."""
-        api_id, api_hash = self.validate_env_vars()
-        self.client = TelegramClient(
-            'session_name',
-            api_id,
-            api_hash
-        )
+    def __init__(self, download_folder, api_id, api_hash, gui_callback=None):
         self.download_folder = Path(download_folder)
         self.download_folder.mkdir(exist_ok=True)
-        self.max_retries = 3
-        self.retry_delay = 5
-        self.chunk_size = 100
-        self.gui_callback = gui_callback
-        self.progress_callback = progress_callback
-
-    def validate_env_vars(self):
-        """Validate required environment variables."""
-        required_vars = ['API_ID', 'API_HASH']
-        missing = [var for var in required_vars if not os.getenv(var)]
-        if missing:
-            raise ValueError(f"Missing environment variables: {', '.join(missing)}")
-        
+        self.api_id = api_id
+        self.api_hash = api_hash
         try:
-            api_id = int(os.getenv('API_ID'))
-        except ValueError:
-            raise ValueError("API_ID must be a valid integer")
-        
-        return api_id, os.getenv('API_HASH')
-
-    async def get_eligible_videos(self, group_name, min_size):
-        """Retrieve all videos from a group that meet date and size criteria."""
-        videos = []
-        since_date = parse_date(os.getenv('SINCE_DATE', ''))
-        max_size_total = parse_size(os.getenv('MAX_TOTAL_SIZE', '10GB'))
-        min_size = parse_size(min_size) if min_size else 0
-        total_size = 0
-        offset_id = 0
-        total_messages_checked = 0
-
-        while True:
-            chunk_videos = []
-            chunk_messages = []
-            for attempt in range(self.max_retries):
-                try:
-                    async for message in self.client.iter_messages(group_name, limit=self.chunk_size, offset_id=offset_id):
-                        chunk_messages.append(message)
-                    break
-                except (RPCError, OSError) as e:
-                    msg = f"Attempt {attempt + 1} failed for {group_name}: {str(e)}"
-                    logging.error(msg)
-                    self.log_to_gui(msg)
-                    if attempt + 1 < self.max_retries:
-                        msg = f"Retrying in {self.retry_delay} seconds..."
-                        logging.info(msg)
-                        self.log_to_gui(msg)
-                        await asyncio.sleep(self.retry_delay)
-                    else:
-                        msg = f"Failed to process {group_name} after {self.max_retries} attempts"
-                        logging.error(msg)
-                        self.log_to_gui(msg)
-                        return videos
-                except ChatAdminRequiredError:
-                    msg = f"Permission denied for group {group_name}. Ensure the account has access."
-                    logging.error(msg)
-                    self.log_to_gui(msg)
-                    return videos
-
-            total_messages_checked += len(chunk_messages)
-            msg = f"Checked {total_messages_checked} messages in {group_name}"
-            logging.info(msg)
-            self.log_to_gui(msg)
-
-            for message in chunk_messages:
-                if not message.video:
-                    continue
-
-                message_date = message.date.replace(tzinfo=None) if message.date.tzinfo else message.date
-                if since_date and message_date < since_date:
-                    continue
-
-                video_size = getattr(message.video, 'size', None)
-                if video_size is None:
-                    msg = f"Skipping video in message {message.id} from {group_name}: No size attribute"
-                    logging.warning(msg)
-                    self.log_to_gui(msg)
-                    continue
-
-                if video_size < min_size:
-                    msg = f"Skipping video in message {message.id} from {group_name}: Size {video_size} bytes is below minimum {min_size} bytes"
-                    logging.info(msg)
-                    self.log_to_gui(msg)
-                    continue
-
-                total_size += video_size
-                if total_size > max_size_total:
-                    msg = f"Total size limit ({max_size_total} bytes) reached for {group_name}"
-                    logging.info(msg)
-                    self.log_to_gui(msg)
-                    return videos
-
-                file_name = getattr(message.video, 'file_name', None)
-                if file_name:
-                    ext = Path(file_name).suffix or '.mp4'
-                else:
-                    mime_type = getattr(message.video, 'mime_type', 'video/mp4')
-                    ext = '.mp4' if 'mp4' in mime_type.lower() else '.mkv' if 'matroska' in mime_type.lower() else '.webm' if 'webm' in mime_type.lower() else '.mp4'
-                filename = sanitize_filename(f"{message_date.strftime('%Y-%m-%d')}_{message.id}{ext}")
-                if (self.download_folder / filename).exists():
-                    msg = f"Skipping video {message.id} from {group_name}: Already downloaded as {filename}"
-                    logging.info(msg)
-                    self.log_to_gui(msg)
-                    continue
-
-                chunk_videos.append(message)
-
-            videos.extend(chunk_videos)
-            if not chunk_messages:
-                break
-            offset_id = chunk_messages[-1].id
-
-        msg = f"Found {len(videos)} eligible videos in {group_name}"
-        logging.info(msg)
-        self.log_to_gui(msg)
-        return videos
-
-    def log_to_gui(self, message):
-        """Send log message to GUI if callback is provided."""
-        if self.gui_callback:
-            self.gui_callback(message)
-
-    async def download_with_progress(self, message, filename):
-        """Download a video with progress updates."""
-        async def progress_callback(downloaded, total):
-            if total and self.progress_callback:
-                percentage = (downloaded / total) * 100
-                self.progress_callback(message.id, filename, percentage)
-
-        try:
-            await message.download_media(self.download_folder / filename, progress_callback=progress_callback)
-            return True
+            self.client = TelegramClient('session_name', api_id, api_hash)
         except Exception as e:
-            return str(e)
+            logging.error(f"Failed to initialize Telegram client: {str(e)}")
+            raise ValueError(f"Failed to initialize Telegram client: {str(e)}")
+        self.log_callback = gui_callback  # For log messages
+        self.progress_callback = None  # For progress updates
 
-    async def run(self, groups, min_size):
-        """Process groups and download eligible videos."""
+    def log(self, message):
+        logging.info(message)
+        if self.log_callback:
+            self.log_callback(message)
+
+    async def download_file(self, message, filename, min_size_bytes, max_total_size_bytes, total_downloaded):
+        if total_downloaded >= max_total_size_bytes:
+            self.log("Max total size reached. Stopping download.")
+            return total_downloaded, False
+
+        if message.file and message.file.size >= min_size_bytes:
+            output_path = self.download_folder / filename
+            try:
+                safe_filename = filename if filename else f"message_{message.id}.mp4"
+                await self.client.download_media(
+                    message,
+                    output_path,
+                    progress_callback=lambda current, total: self.progress_callback(message.id, safe_filename, (current / total) * 100) if self.progress_callback else None
+                )
+                self.log(f"Downloaded: {safe_filename}")
+                return total_downloaded + message.file.size, True
+            except Exception as e:
+                self.log(f"Error downloading {safe_filename}: {str(e)}")
+                return total_downloaded, True
+        return total_downloaded, True
+
+    async def run(self, groups, min_size, max_total_size):
         try:
-            if not groups:
-                raise ValueError("No groups provided")
+            min_size_bytes = parse_size(min_size)
+            max_total_size_bytes = parse_size(max_total_size)
+        except ValueError as e:
+            self.log(f"Invalid size format: {str(e)}")
+            raise
 
-            for attempt in range(self.max_retries):
-                try:
-                    if not self.client.is_connected():
-                        await self.client.connect()
-                    break
-                except (OSError, RPCError) as e:
-                    msg = f"Connection attempt {attempt + 1} failed: {str(e)}"
-                    logging.error(msg)
-                    self.log_to_gui(msg)
-                    if attempt + 1 < self.max_retries:
-                        msg = f"Retrying in {self.retry_delay} seconds..."
-                        logging.info(msg)
-                        self.log_to_gui(msg)
-                        await asyncio.sleep(self.retry_delay)
-                    else:
-                        raise ConnectionError(f"Failed to connect after {self.max_retries} attempts: {str(e)}")
+        total_downloaded = 0
+        continue_download = True
+
+        try:
+            # Ensure fresh connection
+            if self.client.is_connected():
+                await self.client.disconnect()
+            self.log("Connecting to Telegram...")
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                self.log("Session is not authorized. Please re-authenticate.")
+                raise ValueError("Session is not authorized. Please re-authenticate.")
 
             for group in groups:
-                msg = f"Processing group: {group}"
-                logging.info(msg)
-                self.log_to_gui(msg)
-                videos = await self.get_eligible_videos(group, min_size)
-                if not videos:
-                    msg = f"No eligible videos found in {group}"
-                    logging.info(msg)
-                    self.log_to_gui(msg)
-                    continue
+                if not continue_download:
+                    break
+                try:
+                    # Normalize group identifier
+                    group_id = f"@{group}" if group and not group.startswith(('@', '-')) else group
+                    self.log(f"Attempting to access group: {group_id}")
 
-                for msg in videos:
+                    # Revalidate group access and message iteration
                     try:
-                        file_name = getattr(msg.video, 'file_name', None)
-                        if file_name:
-                            ext = Path(file_name).suffix or '.mp4'
-                        else:
-                            mime_type = getattr(msg.video, 'mime_type', 'video/mp4')
-                            ext = '.mp4' if 'mp4' in mime_type.lower() else '.mkv' if 'matroska' in mime_type.lower() else '.webm' if 'webm' in mime_type.lower() else '.mp4'
-                        filename = sanitize_filename(f"{msg.date.strftime('%Y-%m-%d')}_{msg.id}{ext}")
-                        result = await self.download_with_progress(msg, filename)
-                        if result is True:
-                            log_msg = f"Downloaded {filename} from {group}"
-                            logging.info(log_msg)
-                            self.log_to_gui(log_msg)
-                        else:
-                            log_msg = f"Failed to download video {msg.id} from {group}: {result}"
-                            logging.error(log_msg)
-                            self.log_to_gui(log_msg)
-                        await asyncio.sleep(1)
+                        entity = await self.client.get_entity(group_id)
+                        self.log(f"Entity resolved for {group_id}: {entity.__class__.__name__} (ID: {entity.id})")
+                        # Check for video messages
+                        video_found = False
+                        async for message in self.client.iter_messages(entity, limit=10):
+                            if message.media:
+                                if isinstance(message.media, MessageMediaDocument):
+                                    for attr in getattr(message.media.document, 'attributes', []):
+                                        if isinstance(attr, DocumentAttributeVideo):
+                                            video_found = True
+                                            self.log(f"Video found in message {message.id} in {group_id}")
+                                            break
+                                # Handle potential video in other media types
+                                elif isinstance(message.media, MessageMediaPhoto):
+                                    self.log(f"Photo found in message {message.id} in {group_id}, skipping")
+                                else:
+                                    self.log(f"Unknown media type in message {message.id} in {group_id}: {type(message.media)}")
+                            if video_found:
+                                break
+                        if not video_found:
+                            self.log(f"No videos found in group {group_id} within the first 10 messages. Ensure videos exist and are accessible.")
+                            continue
+                        self.log(f"Group {group_id} is accessible and contains videos.")
                     except Exception as e:
-                        log_msg = f"Failed to download video {msg.id} from {group}: {str(e)}"
-                        logging.error(log_msg)
-                        self.log_to_gui(log_msg)
+                        self.log(f"Validation failed for group {group_id}: {str(e)}. Ensure the group exists and your account has permission to view messages.")
+                        continue
 
+                    # Proceed with downloading videos
+                    async for message in self.client.iter_messages(entity):
+                        if message.media and isinstance(message.media, MessageMediaDocument):
+                            for attr in getattr(message.media.document, 'attributes', []):
+                                if isinstance(attr, DocumentAttributeVideo):
+                                    filename = f"{message.id}_{message.media.document.id}.mp4"
+                                    total_downloaded, continue_download = await self.download_file(
+                                        message, filename, min_size_bytes, max_total_size_bytes, total_downloaded
+                                    )
+                                    break
+                except PeerIdInvalidError:
+                    self.log(f"Error accessing group {group}: Invalid group ID or you are not a member. Check if the group exists and your account has access.")
+                except ChannelInvalidError:
+                    self.log(f"Error accessing group {group}: Group or channel does not exist or is inaccessible. Verify the group name or ID.")
+                except UsernameInvalidError:
+                    self.log(f"Error accessing group {group}: Invalid username format. Use @username or a numeric chat ID.")
+                except RPCError as e:
+                    self.log(f"API error accessing group {group}: {str(e)}. If session-related, try deleting session_name.session and re-authenticating.")
+                except Exception as e:
+                    if "TLObject was expected" in str(e):
+                        self.log(f"Error accessing group {group}: {str(e)}. This likely indicates a private group, restricted permissions, or a session issue. Try using the numeric chat ID (e.g., -100123456789), re-authenticating, or checking group permissions.")
+                    else:
+                        self.log(f"Unexpected error accessing group {group}: {str(e)}. Ensure the group exists, is accessible, and your account has permission to view messages.")
+                    # Pause to avoid rate limits
+                    await asyncio.sleep(1)
         except Exception as e:
-            log_msg = f"Fatal error: {str(e)}"
-            logging.error(log_msg)
-            self.log_to_gui(log_msg)
+            self.log(f"Download error: {str(e)}")
+            raise
         finally:
-            log_msg = "Download process completed"
-            logging.info(log_msg)
-            self.log_to_gui(log_msg)
+            if self.client.is_connected():
+                self.log("Disconnecting from Telegram...")
+                await self.client.disconnect()
