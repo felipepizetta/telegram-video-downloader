@@ -1,3 +1,4 @@
 telethon
 asyncio
 PyQt6
+pyinstaller

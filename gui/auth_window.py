@@ -2,12 +2,21 @@ from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit
 from PyQt6.QtCore import Qt, pyqtSignal
 from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError, PhoneCodeInvalidError, FloodWaitError, RPCError
 import asyncio
-import logging
+
+class AuthError(Exception):
+    """Exceção personalizada para erros de autenticação."""
+    pass
 
 class AuthWindow(QDialog):
+    """Janela de diálogo para autenticação no Telegram."""
+    
     auth_completed = pyqtSignal()
+    STATE_PHONE = "phone"
+    STATE_CODE = "code"
+    DEFAULT_PHONE_FORMAT = "e.g., +5519991880399"
 
     def __init__(self, client, loop, parent=None):
+        """Inicializa a janela de autenticação."""
         super().__init__(parent)
         self.setWindowTitle("Telegram Authentication")
         self.setMinimumSize(300, 200)
@@ -15,21 +24,26 @@ class AuthWindow(QDialog):
         self.client = client
         self.loop = loop
         self.phone_number = None
+        self.state = self.STATE_PHONE
 
-        # Layout
+        self._setup_ui()
+        self._initialize_state()
+
+    def _setup_ui(self):
+        """Configura a interface da janela."""
         layout = QVBoxLayout()
         layout.setSpacing(6)
         layout.setContentsMargins(8, 8, 8, 8)
 
         # Status label
-        self.status_label = QLabel("Enter your phone number (e.g., +5519991880399) to receive a code.")
+        self.status_label = QLabel(f"Enter your phone number ({self.DEFAULT_PHONE_FORMAT}) to receive a code.")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         # Phone number input
         phone_layout = QHBoxLayout()
         self.phone_input = QLineEdit()
-        self.phone_input.setPlaceholderText("Phone number (e.g., +5519991880399)")
+        self.phone_input.setPlaceholderText(self.DEFAULT_PHONE_FORMAT)
         self.submit_button = QPushButton("Send Code")
         self.submit_button.clicked.connect(self.submit_action)
         phone_layout.addWidget(QLabel("Phone:"))
@@ -57,154 +71,148 @@ class AuthWindow(QDialog):
         layout.addLayout(retry_layout)
 
         self.setLayout(layout)
-        self.state = "phone"
+
+    def _initialize_state(self):
+        """Define o estado inicial da interface."""
+        self.phone_input.setEnabled(True)
+        self.code_input.setEnabled(False)
+        self.submit_button.setEnabled(True)
+        self.retry_button.setEnabled(False)
+
+    def _set_loading_state(self, is_loading):
+        """Altera o estado da UI para indicar carregamento."""
+        self.phone_input.setEnabled(not is_loading)
+        self.code_input.setEnabled(not is_loading)
+        self.submit_button.setEnabled(not is_loading)
+        self.retry_button.setEnabled(not is_loading)
 
     def submit_action(self):
-        if self.state == "phone":
+        """Executa a ação apropriada com base no estado atual."""
+        if self.state == self.STATE_PHONE:
             self.send_code()
-        elif self.state == "code":
+        elif self.state == self.STATE_CODE:
             self.sign_in()
 
+    async def _send_code_request(self, phone):
+        """Envia solicitação de código para o número de telefone."""
+        try:
+            if self.client.is_connected():
+                await self.client.disconnect()
+            await self.client.connect()
+            await self.client.send_code_request(phone)
+            return True, None
+        except PhoneNumberInvalidError:
+            return False, "Invalid phone number format. Use format like +5519991880399."
+        except FloodWaitError as e:
+            return False, f"Too many requests. Please wait {e.seconds} seconds."
+        except RPCError as e:
+            return False, f"Failed to send code: {str(e)}"
+        except Exception as e:
+            return False, f"Unexpected error: {str(e)}"
+
     def send_code(self):
+        """Processa o envio de código de autenticação."""
         phone = self.phone_input.text().strip()
         if not phone:
-            self.status_label.setText("Please enter a phone number.")
-            QMessageBox.warning(self, "Error", "Please enter a phone number.")
-            logging.warning("Empty phone number entered")
+            self._show_error("Please enter a phone number.")
             return
 
-        async def send_code_request():
-            try:
-                if self.client.is_connected():
-                    await self.client.disconnect()
-                await self.client.connect()
-                await self.client.send_code_request(phone)
-                return True, None
-            except PhoneNumberInvalidError:
-                return False, "Invalid phone number format. Use format like +5519991880399."
-            except FloodWaitError as e:
-                return False, f"Too many requests. Please wait {e.seconds} seconds."
-            except RPCError as e:
-                return False, f"Failed to send code: {str(e)}"
-            except Exception as e:
-                return False, f"Unexpected error: {str(e)}"
-
+        self._set_loading_state(True)
+        self.status_label.setText("Sending code...")
+        future = asyncio.run_coroutine_threadsafe(self._send_code_request(phone), self.loop)
         try:
-            self.status_label.setText("Sending code...")
-            self.submit_button.setEnabled(False)
-            self.retry_button.setEnabled(False)
-            self.phone_input.setEnabled(False)
-            logging.info(f"Attempting to send code to {phone}")
-
-            future = asyncio.run_coroutine_threadsafe(send_code_request(), self.loop)
             success, error = future.result()
-
             if success:
                 self.phone_number = phone
-                logging.info(f"Code sent to {phone}")
-                self.status_label.setText("Code sent. Enter the authentication code received via Telegram.")
-                self.state = "code"
-                self.code_input.setVisible(True)
-                self.code_input.setEnabled(True)
-                self.submit_button.setText("Sign In")
-                self.submit_button.setEnabled(True)
-                self.code_input.setFocus()
+                self._transition_to_code_state()
             else:
-                logging.error(error)
-                self.status_label.setText(error)
-                QMessageBox.critical(self, "Error", error)
-                self.retry_button.setEnabled(True)
-                self.submit_button.setEnabled(True)
-                self.phone_input.setEnabled(True)
+                self._handle_error(error)
         except Exception as e:
-            error_msg = f"Unexpected error in send_code: {str(e)}"
-            logging.error(error_msg)
-            self.status_label.setText(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
-            self.retry_button.setEnabled(True)
-            self.submit_button.setEnabled(True)
-            self.phone_input.setEnabled(True)
+            self._handle_error(f"Unexpected error in send_code: {str(e)}")
+        finally:
+            self._set_loading_state(False)
+
+    async def _sign_in_request(self, code):
+        """Executa a solicitação de login com o código recebido."""
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            await self.client.sign_in(self.phone_number, code)
+            return True, None
+        except SessionPasswordNeededError:
+            return False, "2FA is not supported."
+        except PhoneCodeInvalidError:
+            return False, "Invalid authentication code."
+        except RPCError as e:
+            return False, f"Sign-in failed: {str(e)}"
+        except Exception as e:
+            return False, f"Unexpected error in sign_in: {str(e)}"
 
     def sign_in(self):
+        """Processa o login com o código de autenticação."""
         code = self.code_input.text().strip()
         if not code:
-            self.status_label.setText("Please enter the authentication code.")
-            QMessageBox.warning(self, "Error", "Please enter the authentication code.")
-            logging.warning("Empty authentication code entered")
+            self._show_error("Please enter the authentication code.")
             return
 
-        async def sign_in_request():
-            try:
-                if not self.client.is_connected():
-                    await self.client.connect()
-                await self.client.sign_in(self.phone_number, code)
-                return True, None
-            except SessionPasswordNeededError:
-                return False, "2FA is not supported."
-            except PhoneCodeInvalidError:
-                return False, "Invalid authentication code."
-            except RPCError as e:
-                return False, f"Sign-in failed: {str(e)}"
-            except Exception as e:
-                return False, f"Unexpected error in sign_in: {str(e)}"
-
+        self._set_loading_state(True)
+        self.status_label.setText("Signing in...")
+        future = asyncio.run_coroutine_threadsafe(self._sign_in_request(code), self.loop)
         try:
-            self.status_label.setText("Signing in...")
-            self.submit_button.setEnabled(False)
-            self.retry_button.setEnabled(False)
-            self.code_input.setEnabled(False)
-            logging.info("Attempting to sign in")
-
-            future = asyncio.run_coroutine_threadsafe(sign_in_request(), self.loop)
             success, error = future.result()
-
             if success:
-                logging.info("Successfully signed in")
                 self.status_label.setText("Authentication successful.")
                 self.auth_completed.emit()
                 self.accept()
             else:
-                logging.error(error)
-                self.status_label.setText(error)
-                QMessageBox.critical(self, "Error", error)
-                self.retry_button.setEnabled(True)
-                self.submit_button.setEnabled(True)
-                self.code_input.setEnabled(True)
+                self._handle_error(error)
         except Exception as e:
-            error_msg = f"Unexpected error in sign_in: {str(e)}"
-            logging.error(error_msg)
-            self.status_label.setText(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
-            self.retry_button.setEnabled(True)
-            self.submit_button.setEnabled(True)
-            self.code_input.setEnabled(True)
+            self._handle_error(f"Unexpected error in sign_in: {str(e)}")
+        finally:
+            self._set_loading_state(False)
+
+    def _transition_to_code_state(self):
+        """Transiciona a UI para o estado de entrada de código."""
+        self.state = self.STATE_CODE
+        self.status_label.setText("Code sent. Enter the authentication code received via Telegram.")
+        self.code_input.setVisible(True)
+        self.code_input.setEnabled(True)
+        self.submit_button.setText("Sign In")
+        self.code_input.setFocus()
 
     def retry(self):
-        self.state = "phone"
+        """Reinicia o processo de autenticação."""
+        self.state = self.STATE_PHONE
         self.phone_number = None
-        self.phone_input.setEnabled(True)
-        self.phone_input.clear()
-        self.code_input.setEnabled(False)
+        self._initialize_state()
         self.code_input.clear()
         self.code_input.setVisible(False)
-        self.submit_button.setText("Send Code")
+        self.status_label.setText(f"Enter your phone number ({self.DEFAULT_PHONE_FORMAT}) to receive a code.")
+
+    def _show_error(self, message):
+        """Exibe uma mensagem de erro na UI."""
+        self.status_label.setText(message)
+        QMessageBox.critical(self, "Error", message)
+
+    def _handle_error(self, error):
+        """Trata erros e restaura o estado da UI."""
+        self._show_error(error)
+        self.retry_button.setEnabled(True)
         self.submit_button.setEnabled(True)
-        self.retry_button.setEnabled(False)
-        self.status_label.setText("Enter your phone number (e.g., +5519991880399) to receive a code.")
-        logging.info("Retry authentication initiated")
 
     async def disconnect_client(self):
+        """Desconecta o cliente Telegram de forma segura."""
         if self.client.is_connected():
             try:
                 await self.client.disconnect()
-                logging.info("Telegram client disconnected")
-            except Exception as e:
-                logging.warning(f"Error during disconnect: {str(e)}")
+            except Exception:
+                pass
 
     def closeEvent(self, event):
+        """Gerencia o evento de fechamento da janela."""
         try:
             future = asyncio.run_coroutine_threadsafe(self.disconnect_client(), self.loop)
             future.result()
-        except Exception as e:
-            logging.warning(f"Error during disconnect: {str(e)}")
+        except Exception:
+            pass
         event.accept()
